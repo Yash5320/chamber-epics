@@ -5,23 +5,67 @@ import pandas as pd
 import time
 from datetime import datetime
 from collections import deque
-
-st.set_page_config(page_title="Chamber Operator Dashboard", layout="wide")
 import subprocess
 import sys
+import atexit
 
-# @st.cache_resource guarantees this executes only ONCE on boot, 
-# not on every 1-second UI refresh
+st.set_page_config(page_title="Chamber Operator Dashboard", layout="wide")
+
+class EpicsStackManager:
+    """Manages background EPICS processes and allows safely toggling the PID controller."""
+    def __init__(self):
+        self.ioc_proc = subprocess.Popen([sys.executable, "ioc_server.py"])
+        time.sleep(2.0)  # Wait for IOC socket to bind
+        self.pid_proc = subprocess.Popen([sys.executable, "pid_controller.py"])
+        self.interlock_proc = subprocess.Popen([sys.executable, "interlock_daemon.py"])
+
+    def is_pid_running(self):
+        return self.pid_proc is not None and self.pid_proc.poll() is None
+
+    def stop_pid(self):
+        if self.pid_proc is not None:
+            if self.pid_proc.poll() is None:
+                self.pid_proc.terminate()
+                try:
+                    self.pid_proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    self.pid_proc.kill()
+                    self.pid_proc.wait()
+            self.pid_proc = None
+
+    def start_pid(self):
+        if not self.is_pid_running():
+            self.pid_proc = subprocess.Popen([sys.executable, "pid_controller.py"])
+
+    def cleanup(self):
+        for proc in [self.pid_proc, self.interlock_proc, self.ioc_proc]:
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+
+# @st.cache_resource guarantees this executes only ONCE on boot
 @st.cache_resource
-def start_epics_stack():
-    ioc_proc = subprocess.Popen([sys.executable, "ioc_server.py"])
-    time.sleep(2.0)  # Wait for IOC socket to bind
-    pid_proc = subprocess.Popen([sys.executable, "pid_controller.py"])
-    interlock_proc = subprocess.Popen([sys.executable, "interlock_daemon.py"])
-    return ioc_proc, pid_proc, interlock_proc
+def get_epics_stack():
+    mgr = EpicsStackManager()
+    atexit.register(mgr.cleanup)
+    return mgr
 
-# Boot up the full EPICS machine
-start_epics_stack()
+stack = get_epics_stack()
+
+# Synchronize session state with actual process state on initial load
+if "pid_enabled" not in st.session_state:
+    st.session_state.pid_enabled = stack.is_pid_running()
+
+# Callback triggered ONLY by user interaction (not by periodic reruns)
+def on_pid_toggle():
+    if st.session_state.pid_enabled:
+        stack.start_pid()
+    else:
+        stack.stop_pid()
+
+pid_running = stack.is_pid_running()
 
 if "history" not in st.session_state:
     st.session_state.history = deque(maxlen=60)
@@ -60,7 +104,7 @@ with st.sidebar:
     else:
         st.success("Interlock System: HEALTHY")
 
-    if st.button("Reset Interlock", use_container_width=True):
+    if st.button("Reset Interlock", width="stretch"):
         try:
             write('INTERLOCK:STATUS', 'OK')
             st.toast("Interlock cleared! Status set to OK.")
@@ -69,16 +113,52 @@ with st.sidebar:
 
     st.divider()
 
+    st.subheader("🔥 Heater Control")
     heater_toggle = st.toggle("Heater Power (HEATER:ENABLE)", value=(current_heater == 1.0))
-    if st.button("Apply Heater State", use_container_width=True):
+    if st.button("Apply Heater State", width="stretch"):
         try:
             write('HEATER:ENABLE', 1 if heater_toggle else 0)
             st.toast(f"Heater set to: {1 if heater_toggle else 0}")
         except Exception as e:
             st.error(f"Write failed: {e}")
 
-    new_valve = st.slider("Chiller Valve (%)", 0.0, 100.0, float(current_valve or 0.0), 0.5)
-    if st.button("Set Chiller Valve", use_container_width=True):
+    st.divider()
+
+    st.subheader("🤖 PID & Chiller Valve")
+
+    # Stable toggle linked to session state and callback
+    st.toggle(
+        "PID Controller (Auto Mode)",
+        key="pid_enabled",
+        on_change=on_pid_toggle,
+        help="Turn off to simulate PID controller failure and unlock manual valve control."
+    )
+
+    if pid_running:
+        st.info("🔒 PID active: manual valve control is locked.")
+        valve_display_value = float(current_valve if current_valve is not None else 0.0)
+        st.session_state["manual_valve_pos"] = valve_display_value
+    else:
+        st.warning("⚠️ PID offline: manual valve override is UNLOCKED.")
+        if "manual_valve_pos" not in st.session_state:
+            st.session_state["manual_valve_pos"] = float(current_valve if current_valve is not None else 0.0)
+        valve_display_value = st.session_state["manual_valve_pos"]
+
+    # Valve slider is active ONLY when PID is stopped
+    new_valve = st.slider(
+        "Chiller Valve (%)",
+        min_value=0.0,
+        max_value=100.0,
+        value=valve_display_value,
+        step=0.5,
+        disabled=pid_running,
+        help="Only adjustable when PID Controller is switched off."
+    )
+
+    if not pid_running:
+        st.session_state["manual_valve_pos"] = new_valve
+
+    if st.button("Set Chiller Valve", disabled=pid_running, width="stretch"):
         try:
             write('CHILLER:VALVE', float(new_valve))
             st.toast(f"Valve set to: {new_valve}%")
@@ -105,7 +185,7 @@ with col1:
         }
     ))
     fig_temp.update_layout(height=240, margin=dict(l=20, r=20, t=30, b=10))
-    st.plotly_chart(fig_temp, use_container_width=True)
+    st.plotly_chart(fig_temp, width="stretch")
 
 with col2:
     fig_valve = go.Figure(go.Indicator(
@@ -122,7 +202,7 @@ with col2:
         }
     ))
     fig_valve.update_layout(height=240, margin=dict(l=20, r=20, t=30, b=10))
-    st.plotly_chart(fig_valve, use_container_width=True)
+    st.plotly_chart(fig_valve, width="stretch")
 
 with col3:
     st.metric(
@@ -140,6 +220,12 @@ with col4:
         value=current_interlock,
         delta="NORMAL" if current_interlock == "OK" else "TRIPPED",
         delta_color="normal" if current_interlock == "OK" else "inverse"
+    )
+    st.metric(
+        label="PID Controller",
+        value="ACTIVE" if pid_running else "STOPPED",
+        delta="ONLINE" if pid_running else "FAILURE SIM",
+        delta_color="normal" if pid_running else "inverse"
     )
 
 st.subheader("📈 Real-Time Temperature History (Last 60 Seconds)")
@@ -165,7 +251,7 @@ if len(st.session_state.history) > 1:
         height=350,
         margin=dict(l=20, r=20, t=20, b=20)
     )
-    st.plotly_chart(fig_line, use_container_width=True)
+    st.plotly_chart(fig_line, width="stretch")
 else:
     st.info("Accumulating telemetry data...")
 
