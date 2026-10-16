@@ -15,7 +15,7 @@ class CavityIOC(PVGroup):
         cooling = (self.valve.value / 100.0) * (current_temp - 15.0) * 0.2
         ambient_loss = (current_temp - 22.0) * 0.02
         noise = np.random.normal(0, 0.02)
-        new_temp = round(current_temp + (heating - cooling - ambient_loss) * 0.3 + noise, 3)
+        new_temp = round(current_temp + (heating - cooling - ambient_loss) * 0.2 + noise, 3)
 
         await instance.write(value=new_temp)
 
