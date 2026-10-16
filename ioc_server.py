@@ -12,7 +12,7 @@ class CavityIOC(PVGroup):
     async def temp(self, instance, async_lib):
         current_temp = self.temp.value
         heating = 2.5 if self.heater_enable.value == 1 else 0.0
-        cooling = (self.valve.value / 100.0) * (current_temp - 15.0) * 0.2
+        cooling = (self.valve.value / 100.0) * (current_temp - 15.0) * 0.16
         ambient_loss = (current_temp - 22.0) * 0.02
         noise = np.random.normal(0, 0.02)
         new_temp = round(current_temp + (heating - cooling - ambient_loss) * 0.2 + noise, 3)
