@@ -1,3 +1,4 @@
+
 # 🎛️ Vacuum Chamber EPICS Control & Monitoring System
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
@@ -19,6 +20,7 @@ A distributed SCADA / Operator Interface (OPI) and hardware simulation stack bui
   - [2. Closed-Loop PID Temperature Controller (`pid_controller.py`)](#2-closed-loop-pid-temperature-controller-pid_controllerpy)
   - [3. Safety Interlock Daemon (`interlock_daemon.py`)](#3-safety-interlock-daemon-interlock_daemonpy)
   - [4. Operator Dashboard & Supervisor (`dashboard.py`)](#4-operator-dashboard--supervisor-dashboardpy)
+- [Failure Mode Simulation & Manual Override](#-failure-mode-simulation--manual-override)
 - [Installation & Local Setup](#-installation--local-setup)
 - [Running the System](#-running-the-system)
   - [Option A: Integrated Launcher (Recommended)](#option-a-integrated-launcher-recommended)
@@ -44,8 +46,9 @@ flowchart TD
         INT["interlock_daemon.py<br/>Safety Guard (10 Hz)<br/>Failsafe Cutoff"]
     end
 
-    subgraph HMI["Operator Interface"]
+    subgraph HMI["Operator Interface & Supervisor"]
         UI["dashboard.py<br/>Streamlit & Plotly HMI<br/>Telemetry & Overrides"]
+        MGR["EpicsStackManager<br/>Subprocess Lifecycle<br/>PID Failure Injection"]
     end
 
     IOC -->|CAVITY:TEMP| PID
@@ -57,9 +60,9 @@ flowchart TD
     IOC -->|CA Read 1.0s| UI
     UI -->|Manual Overrides| IOC
 
-    UI -.->|Subprocess Spawn| IOC
-    UI -.->|Subprocess Spawn| PID
-    UI -.->|Subprocess Spawn| INT
+    MGR -.->|Spawns / Monitors| IOC
+    MGR -.->|Toggles / Restarts| PID
+    MGR -.->|Spawns / Monitors| INT
 ```
 
 ---
@@ -83,8 +86,8 @@ Implements an EPICS Input/Output Controller using `caproto.server.PVGroup`. It s
 
 - **Thermal Model:**
   $$\Delta T = \left( \dot{Q}_{\text{heater}} - \dot{Q}_{\text{chiller}} - \dot{Q}_{\text{ambient}} \right) \cdot \Delta t + \mathcal{N}(0, \sigma^2)$$
-  - **Heating:** $\dot{Q}_{\text{heater}} = 2.5\text{ °C/s}$ when `HEATER:ENABLE = 1`.
-  - **Chiller Dissipation:** $\dot{Q}_{\text{chiller}} = \left(\frac{\text{Valve}}{100}\right) \cdot (T - 15.0) \cdot 0.15$.
+  - **Heating:** $\dot{Q}_{\text{heater}} = 2.5\text{ °C/s}$ when `HEATER:ENABLE = 1` ($0.0\text{ °C/s}$ when OFF).
+  - **Chiller Dissipation:** $\dot{Q}_{\text{chiller}} = \left(\frac{\text{Valve}}{100}\right) \cdot (T - 15.0) \cdot 0.16$.
   - **Ambient Heat Loss:** $\dot{Q}_{\text{ambient}} = (T - 22.0) \cdot 0.02$.
   - **Process Noise:** Gaussian noise with standard deviation $\sigma = 0.02\text{ °C}$.
 - **Vacuum Gauge Simulation:** Nominal ultra-high vacuum level at $1.0 \times 10^{-7}\text{ Torr}$ with randomized micro-fluctuations.
@@ -93,23 +96,54 @@ Implements an EPICS Input/Output Controller using `caproto.server.PVGroup`. It s
 Maintains `CAVITY:TEMP` at a steady **30.0 °C setpoint** by regulating `CHILLER:VALVE`:
 - **Gains:** $K_p = 12.0$, $K_i = 0.8$, $K_d = 2.5$
 - **Cycle Time:** $200\text{ ms}$ (5 Hz)
-- **Actuation Range:** $0.0\text{ \%}$ (closed) to $100.0\text{ \%}$ (full bypass coolant flow).
-- **Anti-Windup:** Integral accumulation and derivative calculations are executed continuously against a dynamic $\Delta t$.
+- **Actuation Range:** Clamped between $0.0\text{ \%}$ (fully closed) and $100.0\text{ \%}$ (full coolant bypass flow).
+- **Telemetry Throttling:** Prints live process variable values every 10 cycles (2 seconds) to avoid console I/O blocking.
 
 ### 3. Safety Interlock Daemon (`interlock_daemon.py`)
 Hardware protection loop evaluating system telemetry every $100\text{ ms}$ (10 Hz). If trip criteria are met:
 1. `HEATER:ENABLE` is immediately forced to `0`.
 2. `INTERLOCK:STATUS` is transitioned into an active latched `TRIP: <reason>` state.
-3. The system ignores heating requests until an operator explicitly issues an interlock reset while telemetry is within safe limits.
+3. String status decoding cleans trailing null bytes (`\x00`) to guarantee deterministic string comparison against EPICS `DBF_STRING` records.
 
 ### 4. Operator Dashboard & Supervisor (`dashboard.py`)
-A modern Streamlit web interface functioning as an accelerator control room OPI:
-- **Supervisor Engine:** Automatically bootstraps the background IOC, PID, and Interlock daemons on launch using `@st.cache_resource`.
+A Streamlit web interface functioning as an accelerator control room OPI:
+- **Supervisor Engine (`EpicsStackManager`):** Manages background IOC, PID, and Interlock daemons on launch using `@st.cache_resource` and registers clean teardown routines with `atexit`.
 - **Live Visualizations:**
-  - Dynamic Plotly arc gauges for Cavity Temperature and Chiller Valve position with colored warning/trip zones.
-  - Telemetry metric panels for high-vacuum readings, heater states, and interlock health.
+  - Dynamic Plotly arc gauges for Cavity Temperature and Chiller Valve position with color-coded operational and warning zones.
+  - Telemetry metric panels for high-vacuum ionization gauge readings, heater states, and interlock health.
   - 60-second rolling trend plot displaying real-time temperature, setpoint (30 °C), and critical safety threshold (40 °C).
-- **Control Interface:** Manual interlock reset trigger, heater toggle switch, and manual valve position override sliders.
+- **Operator Controls:** Manual interlock reset triggers, heater toggle switches, and an automated arbitration system for chiller valve control.
+
+---
+
+## 🛑 Failure Mode Simulation & Manual Override
+
+To simulate real-world hardware, network, and controller anomalies, the Operator Dashboard features an interactive **Fault Injection & Manual Override Subsystem**:
+
+```
+       [PID Controller Active] ──(Operator Toggles OFF)──> [Subprocess Terminated]
+                 │                                                    │
+                 ▼                                                    ▼
+   [Manual Slider LOCKED (Read-Only)]                [Manual Slider UNLOCKED (Read/Write)]
+   [Autonomous PID Regulates Valve]                 [Operator Modulates Valve Position]
+```
+
+### 1. Simulating PID Controller Failure
+- **Process Suspension:** Operators can toggle the **PID Controller (Auto Mode)** switch in the sidebar. This instructs `EpicsStackManager` to terminate the running `pid_controller.py` subprocess via `SIGTERM` (with a timeout-escalated `SIGKILL` fallback).
+- **Actuator Arbitration:** 
+  - **When PID is Active:** The dashboard enforces mutual exclusion by locking the **Chiller Valve (%)** slider (`disabled=True`). This prevents human operator input from racing against the PID loop's 5 Hz writes.
+  - **When PID is Offline:** The manual valve slider is immediately unlocked. Operators can manually position the coolant valve from 0% to 100%.
+
+### 2. Thermal Runaway & Protection Demonstration
+- When the PID controller is stopped while the heater remains active (`HEATER:ENABLE = 1`), the chiller valve remains stuck at its last known position.
+- If the valve is insufficiently open, the chamber enters a **thermal runaway trajectory**.
+- Once `CAVITY:TEMP` crosses the **40.0 °C** safety limit, the independent `interlock_daemon.py` acts as a fail-safe: it immediately kills heater power and latches `INTERLOCK:STATUS = "TRIP: Temperature over the limit"`.
+
+### 3. Manual Recovery Sequence
+1. With the PID offline, manually increase the **Chiller Valve (%)** slider (e.g., to 75–100%) and click **Set Chiller Valve** to cool down the chamber.
+2. Wait until the chamber temperature drops back below **40.0 °C**.
+3. Click the **Reset Interlock** button on the sidebar to return status to `HEALTHY`.
+4. Toggle the **PID Controller (Auto Mode)** switch back ON. The supervisor will spawn a fresh instance of `pid_controller.py`, automatically taking over closed-loop regulation.
 
 ---
 
@@ -123,15 +157,15 @@ A modern Streamlit web interface functioning as an accelerator control room OPI:
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/vacuum-chamber-epics.git
-cd vacuum-chamber-epics
+git clone https://github.com/Yash5320/chamber-epics.git
+cd chamber-epics
 
 # Create and activate a virtual environment
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 # Install required dependencies
-pip install -r requirements.txt
+pip install caproto streamlit plotly pandas numpy scipy
 ```
 
 ---
@@ -149,7 +183,7 @@ Open your browser at `http://localhost:8501`.
 ---
 
 ### Option B: Distributed / Multi-Terminal Mode
-If running across separate machines or debugging individual subsystems, comment out `start_epics_stack()` in `dashboard.py` and run each process in its own shell:
+If running across separate machines or debugging individual subsystems, comment out `stack = get_epics_stack()` in `dashboard.py` and run each process in its own shell:
 
 ```bash
 # Terminal 1: Run the Soft IOC Server
@@ -169,12 +203,12 @@ streamlit run dashboard.py
 
 ## 🚨 Safety Interlocks & Trip Logic
 
-The Interlock Daemon triggers under the following conditions:
+The Interlock Daemon evaluates telemetry at 10 Hz and triggers under the following conditions:
 
-| Parameter | Safety Threshold | Action Taken |
-| :--- | :--- | :--- |
-| **Over-Temperature** | `CAVITY:TEMP > 40.0 °C` | Immediate Heater Cutoff (`HEATER:ENABLE = 0`), trip latched |
-| **Loss of Vacuum** | `CAVITY:VACUUM > 1.0e-5 Torr` | Immediate Heater Cutoff (`HEATER:ENABLE = 0`), trip latched |
+| Parameter | Safety Threshold | Action Taken | Latched? |
+| :--- | :--- | :--- | :--- |
+| **Over-Temperature** | `CAVITY:TEMP > 40.0 °C` | Immediate Heater Cutoff (`HEATER:ENABLE = 0`) | Yes (`TRIP: Temperature over the limit`) |
+| **Loss of Vacuum** | `CAVITY:VACUUM > 1.0e-5 Torr` | Immediate Heater Cutoff (`HEATER:ENABLE = 0`) | Yes (`TRIP: Vacuum degraded`) |
 
 ### Clearing an Interlock Trip
 1. Allow chamber temperature to drop below **40.0 °C** (chiller will actively cool).
@@ -187,22 +221,21 @@ The Interlock Daemon triggers under the following conditions:
 ## 🌐 Deployment Considerations
 
 ### Running on Streamlit Community Cloud
-- Caproto binds to loopback interfaces (`127.0.0.1` / broadcast) within the same container. When hosted on Streamlit Cloud, all daemons spawned by `start_epics_stack()` run inside that single Linux container.
+- Caproto binds to loopback interfaces (`127.0.0.1` / broadcast) within the same container. When hosted on Streamlit Cloud, all daemons spawned by `EpicsStackManager` run inside that single Linux container.
 - Note that Streamlit Cloud will put inactive apps into sleep mode. When woken up, `@st.cache_resource` will cleanly re-initialize the EPICS stack.
 
 ### Running on Real Hardware / Production Subnets
 To connect this interface to physical EPICS IOCs or hardware controllers:
-1. Remove `start_epics_stack()` from `dashboard.py`.
+1. Remove `EpicsStackManager` from `dashboard.py`.
 2. Configure EPICS environment variables on the host:
    ```bash
-   export EPICS_CA_ADDR_LIST="192.168.1.255"  # Your subnet broadcast
+   export EPICS_CA_ADDR_LIST="192.168.1.255"  # Your facility subnet broadcast
    export EPICS_CA_AUTO_ADDR_LIST="NO"
    ```
-3. Update the PV names to match your production facility naming conventions (e.g., `VAC:CHAMBER:TC1`, `LLRF:CAV:TEMP`).
+3. Update the PV names in the scripts to match your production facility naming conventions (e.g., `VAC:CHAMBER:TC1`, `LLRF:CAV:TEMP`).
 
 ---
 
 ## 📄 License
 
 This project is open-source under the [MIT License](LICENSE).
-```
