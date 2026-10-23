@@ -9,6 +9,8 @@
 
 A distributed SCADA / Operator Interface (OPI) and hardware simulation stack built for high-vacuum thermal chambers. This system implements the **EPICS (Experimental Physics and Industrial Control System)** Channel Access protocol using **Caproto**, a discrete-time thermodynamic simulation, an autonomous closed-loop PID controller, a high-priority safety interlock daemon, and an interactive real-time dashboard built with **Streamlit** and **Plotly**.
 
+![Sample Image](Sample_image.png)
+
 ---
 
 ## 📑 Table of Contents
